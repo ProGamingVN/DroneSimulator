@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quadcopter Drone Simulator</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        /* Safety disclaimer styling */
+        #disclaimer {
+            background-color: #ffeb3b;
+            color: #000;
+            padding: 10px;
+            text-align: center;
+            font-weight: bold;
+            margin-bottom: 10px;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div id="disclaimer">
+        ⚠️ SAFETY DISCLAIMER: Educational simulation only. Not for real flight control or training.
+    </div>
+    <div id="container">
+        <canvas id="droneCanvas"></canvas>
+        <div id="info">
+            <h2>Drone Telemetry</h2>
+            <div id="telemetry">
+                <p>Altitude: <span id="altitude">0.00</span> m</p>
+                <p>Roll: <span id="roll">0.00</span> °</p>
+                <p>Pitch: <span id="pitch">0.00</span> °</p>
+                <p>Yaw: <span id="yaw">0.00</span> °</p>
+                <p>Motor 1 (Front): <span id="motor1">0</span> %</p>
+                <p>Motor 2 (Right): <span id="motor2">0</span> %</p>
+                <p>Motor 3 (Back): <span id="motor3">0</span> %</p>
+                <p>Motor 4 (Left): <span id="motor4">0</span> %</p>
+            </div>
+            <div id="controls">
+                <h3>Controls</h3>
+                <p>Throttle: W/S</p>
+                <p>Roll: A/D</p>
+                <p>Pitch: ↑/↓</p>
+                <p>Yaw: ,/.</p>
+            </div>
+        </div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>
