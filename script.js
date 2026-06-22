@@ -1,461 +1,477 @@
-// Drone Simulator using Three.js
-// Educational simulation only - not for real flight
-
-// Global variables for Three.js
-let scene, camera, renderer;
-let droneGroup; // Group to hold all drone parts
-let ground;
-
-// Physics variables
-let mass = 1.0; // kg
-let g = 9.81; // m/s^2
-let max_thrust = 2 * mass * g; // N (so 50% throttle gives hover)
-
-let position = new THREE.Vector3(0, 0, 0); // world position (y is up)
-let velocity = new THREE.Vector3(0, 0, 0); // world velocity
-let quaternion = new THREE.Vector3(0, 0, 0, 1).set(0, 0, 0, 1); // [x, y, z, w]
-let angularVelocity = new THREE.Vector3(0, 0, 0); // body frame angular velocity (rad/s)
-
-// Inertia (symmetric)
-let Ixx = 0.1, Iyy = 0.1, Izz = 0.1; // kg*m^2
-
-// Motor constants
-let armLength = 0.5; // meters
-let motorRadius = 0.05;
-let bodySize = 0.3;
-
-// PID controller class
-class PID {
-    constructor(Kp, Ki, Kd) {
-        this.Kp = Kp;
-        this.Ki = Ki;
-        this.Kd = Kd;
-        this.integral = 0;
-        this.previousError = 0;
-    }
-
-    compute(error, dt) {
-        if (dt <= 0) return 0;
-        this.integral += error * dt;
-        const derivative = (error - this.previousError) / dt;
-        const output = this.Kp * error + this.Ki * this.integral + this.Kd * derivative;
-        this.previousError = error;
-        return output;
-    }
-
-    reset() {
-        this.integral = 0;
-        this.previousError = 0;
-    }
-}
-
-// PID controllers for attitude (roll, pitch, yaw)
-let pidRoll = new PID(4.0, 0.2, 0.8); // tune these gains
-let pidPitch = new PID(4.0, 0.2, 0.8);
-let pidYaw = new PID(2.0, 0.0, 0.5); // yaw PID often needs less integral
-
-// User input state
-let keys = {
-    ArrowUp: false,
-    ArrowDown: false,
-    ArrowLeft: false,
-    ArrowRight: false,
-    KeyW: false,
-    KeyS: false,
-    Comma: false,
-    Period: false
-};
-
-// Desired setpoints (from user input)
-let desiredRoll = 0; // degrees
-let desiredPitch = 0; // degrees
-let desiredYaw = 0; // degrees
-let desiredThrottle = 0.0; // 0 to 1
-
-// Input step sizes
-const rollStep = 2; // degrees per key press
-const pitchStep = 2;
-const yawStep = 2;
-const throttleStep = 0.02;
-
-// Motor thrust coefficients (simplified)
-let thrustConstant = 1.0; // N/(rad/s)^2 - actual value depends on motor/prop
-let torqueConstant = 0.02; // N*m/(rad/s)^2 - yaw torque per motor
-
-// Motor forces (will be computed each frame)
-let motorForces = [0, 0, 0, 0]; // F1, F2, F3, F4
-
-// Initialize the simulation
-function init() {
-    // Scene setup
-    scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x87ceeb); // sky blue
-
-    // Camera
-    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    camera.position.set(0, 5, 10);
-    camera.lookAt(0, 0, 0);
-
-    // Renderer
-    renderer = new THREE.WebGLRenderer({ antialias: true, canvas: document.getElementById('droneCanvas') });
-    renderer.setSize(window.innerWidth, window.innerHeight);
-
-    // Lights
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-    scene.add(ambientLight);
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-    directionalLight.position.set(5, 10, 7);
-    scene.add(directionalLight);
-
-    // Ground plane
-    const groundGeometry = new THREE.PlaneGeometry(100, 100);
-    const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x555555 });
-    ground = new THREE.Mesh(groundGeometry, groundMaterial);
-    ground.rotation.x = -Math.PI / 2; // rotate to be horizontal
-    ground.position.y = 0;
-    scene.add(ground);
-
-    // Create drone model
-    createDroneModel();
-
-    // Set initial drone position slightly above ground
-    position.y = 1.0;
-
-    // Event listeners for keyboard input
-    window.addEventListener('keydown', (e) => {
-        if (keys.hasOwnProperty(e.code)) keys[e.code] = true;
-    });
-    window.addEventListener('keyup', (e) => {
-        if (keys.hasOwnProperty(e.code)) keys[e.code] = false;
-    });
-
-    // Handle window resize
-    window.addEventListener('resize', () => {
-        camera.aspect = window.innerWidth / window.innerHeight;
-        camera.updateProjectionMatrix();
-        renderer.setSize(window.innerWidth, window.innerHeight);
-    });
-
-    // Start animation loop
-    animate();
-}
-
-// Create the drone visual model
-function createDroneModel() {
-    droneGroup = new THREE.Group();
-
-    // Central body (cube)
-    const bodyGeometry = new THREE.BoxGeometry(bodySize, bodySize, bodySize);
-    const bodyMaterial = new THREE.MeshStandardMaterial({ color: 0x606060 });
-    const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
-    body.position.y = 0; // center at origin
-    droneGroup.add(body);
-
-    // Arms and motors
-    const armColor = 0x009688; // teal
-    const motorColor = 0x424242; // dark gray
-    const propColor = 0x212121; // very dark gray
-
-    // Motor positions: [front, right, back, left] -> [+y, +x, -y, -x] in drone's body frame
-    // Note: In our body frame: x=forward, y=right, z=down
-    // But for visualization, we'll place arms along x and z axes?
-    // Let's define:
-    //   Arm 1 (front): along +z (using three.js z as forward? Actually we want y up, so let's use x for forward, z for right)
-    //   To avoid confusion, we'll place:
-    //   Motor 1 (front): (0, 0, armLength)  // +z
-    //   Motor 2 (right): (armLength, 0, 0)   // +x
-    //   Motor 3 (back): (0, 0, -armLength)   // -z
-    //   Motor 4 (left): (-armLength, 0, 0)   // -x
-    // This means the drone's front is +z, right is +x.
-    // Then the body's forward is +z, right is +x, up is +y.
-
-    const armLengthVis = armLength * 0.8; // slightly shorter for visuals
-    const armThickness = 0.05;
-    const armWidth = 0.15;
-
-    // Arm 1 (front)
-    const arm1Geometry = new THREE.BoxGeometry(armThickness, armWidth, armLengthVis);
-    const arm1Material = new THREE.MeshStandardMaterial({ color: armColor });
-    const arm1 = new THREE.Mesh(arm1Geometry, arm1Material);
-    arm1.position.set(0, 0, armLengthVis/2);
-    droneGroup.add(arm1);
-
-    // Motor 1 (front)
-    const motor1Geometry = new THREE.CylinderGeometry(motorRadius, motorRadius, 0.02, 16);
-    const motor1Material = new THREE.MeshStandardMaterial({ color: motorColor });
-    const motor1 = new THREE.Mesh(motor1Geometry, motor1Material);
-    motor1.position.set(0, 0, armLengthVis);
-    droneGroup.add(motor1);
-
-    // Propeller 1 (front) - spinning disc
-    const prop1Geometry = new THREE.CylinderGeometry(0.15, 0.15, 0.01, 32);
-    const prop1Material = new THREE.MeshStandardMaterial({ color: propColor });
-    const prop1 = new THREE.Mesh(prop1Geometry, prop1Material);
-    prop1.position.set(0, 0, armLengthVis + 0.015);
-    prop1.rotation.x = Math.PI / 2; // make it face forward? Actually propeller should be perpendicular to arm
-    // For front arm along z, propeller should be in x-y plane?
-    // We'll make it spin around the arm's axis (z-axis) so rotation should be around z.
-    // But we set the cylinder's height along z, so to have it perpendicular to arm (along z), we need to rotate it 90 degrees around x or y.
-    // Let's set the propeller as a disc in the x-y plane (so normal along z).
-    // Then for front arm (along z), the disc is already in x-y plane -> good.
-    // So we leave rotation as is (default cylinder along z, we want it in x-y plane -> rotate 90 around x).
-    prop1.rotation.x = Math.PI / 2;
-    droneGroup.add(prop1);
-
-    // Arm 2 (right)
-    const arm2Geometry = new THREE.BoxGeometry(armLengthVis, armWidth, armThickness);
-    const arm2Material = new THREE.MeshStandardMaterial({ color: armColor });
-    const arm2 = new THREE.Mesh(arm2Geometry, arm2Material);
-    arm2.position.set(armLengthVis/2, 0, 0);
-    droneGroup.add(arm2);
-
-    // Motor 2 (right)
-    const motor2 = motor1.clone();
-    motor2.position.set(armLengthVis, 0, 0);
-    droneGroup.add(motor2);
-
-    // Propeller 2 (right)
-    const prop2 = prop1.clone();
-    prop2.position.set(armLengthVis, 0, 0.015);
-    prop2.rotation.x = Math.PI / 2;
-    // For right arm along x, propeller should be in y-z plane -> rotate 90 around y
-    prop2.rotation.y = Math.PI / 2;
-    droneGroup.add(prop2);
-
-    // Arm 3 (back)
-    const arm3Geometry = new THREE.BoxGeometry(armThickness, armWidth, armLengthVis);
-    const arm3Material = new THREE.MeshStandardMaterial({ color: armColor });
-    const arm3 = new THREE.Mesh(arm3Geometry, arm3Material);
-    arm3.position.set(0, 0, -armLengthVis/2);
-    droneGroup.add(arm3);
-
-    // Motor 3 (back)
-    const motor3 = motor1.clone();
-    motor3.position.set(0, 0, -armLengthVis);
-    droneGroup.add(motor3);
-
-    // Propeller 3 (back)
-    const prop3 = prop1.clone();
-    prop3.position.set(0, 0, -armLengthVis - 0.015);
-    prop3.rotation.x = Math.PI / 2;
-    droneGroup.add(prop3);
-
-    // Arm 4 (left)
-    const arm4Geometry = new THREE.BoxGeometry(armLengthVis, armWidth, armThickness);
-    const arm4Material = new THREE.MeshStandardMaterial({ color: armColor });
-    const arm4 = new THREE.Mesh(arm4Geometry, arm4Material);
-    arm4.position.set(-armLengthVis/2, 0, 0);
-    droneGroup.add(arm4);
-
-    // Motor 4 (left)
-    const motor4 = motor1.clone();
-    motor4.position.set(-armLengthVis, 0, 0);
-    droneGroup.add(motor4);
-
-    // Propeller 4 (left)
-    const prop4 = prop1.clone();
-    prop4.position.set(-armLengthVis, 0, 0.015);
-    prop4.rotation.x = Math.PI / 2;
-    prop4.rotation.y = Math.PI / 2;
-    droneGroup.add(prop4);
-
-    // Store references to propellers for animation
-    droneGroup.propellers = [prop1, prop2, prop3, prop4];
-
-    // Add drone to scene
-    scene.add(droneGroup);
-}
-
-// Update drone visual based on physics state
-function updateDroneVisual(dt) {
-    // Set position and orientation
-    droneGroup.position.copy(position);
-    droneGroup.setRotationFromQuaternion(quaternion);
-
-    // Update propeller spins (based on motor forces)
-    const spinSpeeds = [0, 0, 0, 0];
-    // Convert thrust to angular speed (simplified: omega = sqrt(F / k))
-    for (let i = 0; i < 4; i++) {
-        const F = Math.max(0, motorForces[i]);
-        spinSpeeds[i] = Math.sqrt(F / thrustConstant) * 5; // scale factor for visual
-    }
-
-    // Apply rotation to each propeller
-    droneGroup.propellers[0].rotation.z += spinSpeeds[0] * dt; // front
-    droneGroup.propellers[1].rotation.z += spinSpeeds[1] * dt; // right
-    droneGroup.propellers[2].rotation.z += spinSpeeds[2] * dt; // back
-    droneGroup.propellers[3].rotation.z += spinSpeeds[3] * dt; // left
-}
-
-// Physics update function
-function updatePhysics(dt) {
-    // 1. Get user input and update desired setpoints
-    processInput(dt);
-
-    // 2. Compute current orientation angles (roll, pitch, yaw) from quaternion
-    // Convert quaternion to Euler angles (in degrees)
-    const euler = new THREE.Euler();
-    euler.setFromQuaternion(quaternion, 'YXZ'); // yaw, pitch, roll - but we want roll, pitch, yaw
-    // Actually, we'll extract roll (x), pitch (y), yaw (z) from Euler set as 'XYZ'
-    euler.setFromQuaternion(quaternion, 'XYZ');
-    const roll = THREE.MathUtils.radToDeg(euler.x);
-    const pitch = THREE.MathUtils.radToDeg(euler.y);
-    const yaw = THREE.MathUtils.radToDeg(euler.z);
-
-    // 3. Compute errors
-    const rollError = desiredRoll - roll;
-    const pitchError = desiredPitch - pitch;
-    const yawError = desiredYaw - yaw;
-
-    // 4. Compute PID outputs (desired torques in body frame, N*m)
-    const tauRoll = pidRoll.compute(rollError, dt);
-    const tauPitch = pidPitch.compute(pitchError, dt);
-    const tauYaw = pidYaw.compute(yawError, dt);
-
-    // 5. Compute collective thrust from throttle
-    const Ftotal = desiredThrottle * max_thrust;
-
-    // 6. Compute individual motor forces using mixing matrix
-    // Formulas derived earlier:
-    // F2 + F3 = (Ftotal - (tauRoll + tauPitch)/armLength) / 2
-    // F3 - F2 = (tauYaw/torqueConstant - (pitchError - rollError)/armLength) / 2
-    // Note: We're using errors in the yaw formula? Actually we should use the PID output for yaw torque.
-    // But note: tauYaw is already the desired yaw torque from PID.
-    // So:
-    const S = (Ftotal - (tauRoll + tauPitch) / armLength) / 2;
-    const D = (tauYaw / torqueConstant - (tauPitch - tauRoll) / armLength) / 2; // Check signs
-    // Let me re-derive with signs:
-    // tauRoll = L * (-F2 + F4)
-    // tauPitch = L * (F1 - F3)
-    // tauYaw = b * (F1 - F2 + F3 - F4)
-    // We had:
-    // F1 = F3 + tauPitch/L
-    // F4 = F2 + tauRoll/L
-    // Then Ftotal = F1+F2+F3+F4 = 2F3 + tauPitch/L + 2F2 + tauRoll/L
-    // => F2 + F3 = (Ftotal - (tauRoll+tauPitch)/L)/2   (same as S)
-    // And tauYaw/b = F1 - F2 + F3 - F4 = (F3+tauPitch/L) - F2 + F3 - (F2+tauRoll/L)
-    // = 2F3 - 2F2 + tauPitch/L - tauRoll/L
-    // => F3 - F2 = (tauYaw/b - (tauPitch - tauRoll)/L)/2
-    // So D = (tauYaw/torqueConstant - (tauPitch - tauRoll)/armLength)/2
-
-    motorForces[1] = (S - D) / 2; // F2 (right)
-    motorForces[2] = (S + D) / 2; // F3 (back)
-    motorForces[0] = motorForces[2] + tauPitch / armLength; // F1 = F3 + tauPitch/L
-    motorForces[3] = motorForces[1] - tauRoll / armLength;  // F4 = F2 - tauRoll/L? Wait check:
-    // From F4 = F2 + tauRoll/L -> so F4 = F2 + tauRoll/L
-    // But above I had F4 = F2 + tauRoll/L, so:
-    motorForces[3] = motorForces[1] + tauRoll / armLength; // F4 = F2 + tauRoll/L
-
-    // Double-check F1: F1 = F3 + tauPitch/L
-    motorForces[0] = motorForces[2] + tauPitch / armLength;
-
-    // Ensure no negative forces (motors can't pull)
-    for (let i = 0; i < 4; i++) {
-        motorForces[i] = Math.max(0, motorForces[i]);
-    }
-
-    // 7. Compute total force and torque in body frame
-    // Thrust is along -z_body (since we defined z_body as down, thrust up is negative z)
-    const thrustBody = new THREE.Vector3(0, 0, -Ftotal);
-    const torqueBody = new THREE.Vector3(tauRoll, tauPitch, tauYaw);
-
-    // 8. Convert thrust to world frame
-    const thrustWorld = thrustBody.clone().applyQuaternion(quaternion);
-
-    // 9. Compute net force (thrust + gravity)
-    const gravity = new THREE.Vector3(0, -g, 0); // y is up
-    const forceWorld = thrustWorld.clone().add(gravity).multiplyScalar(1 / mass); // F=ma -> a = F/m
-
-    // 10. Update linear motion (Euler integration)
-    velocity.add(forceWorld.clone().multiplyScalar(dt));
-    position.add(velocity.clone().multiplyScalar(dt));
-
-    // 11. Update angular motion
-    // Angular acceleration in body frame: alpha = I^-1 * (torque - omega x (I*omega))
-    const Iomega = new THREE.Vector3(
-        Ixx * angularVelocity.x,
-        Iyy * angularVelocity.y,
-        Izz * angularVelocity.z
-    );
-    const cross = new THREE.Vector3(
-        angularVelocity.y * Iomega.z - angularVelocity.z * Iomega.y,
-        angularVelocity.z * Iomega.x - angularVelocity.x * Iomega.z,
-        angularVelocity.x * Iomega.y - angularVelocity.y * Iomega.x
-    );
-    const angularAccel = new THREE.Vector3(
-        (torqueBody.x - cross.x) / Ixx,
-        (torqueBody.y - cross.y) / Iyy,
-        (torqueBody.z - cross.z) / Izz
-    );
-
-    angularVelocity.add(angularAccel.clone().multiplyScalar(dt));
-
-    // 12. Update orientation (quaternion)
-    const omegaQuat = new THREE.Quaternion(0, angularVelocity.x, angularVelocity.y, angularVelocity.z);
-    const dq = omegaQuat.multiply(new THREE.Quaternion(quaternion.x, quaternion.y, quaternion.z, quaternion.w)).multiplyScalar(0.5);
-    quaternion.x += dq.x * dt;
-    quaternion.y += dq.y * dt;
-    quaternion.z += dq.z * dt;
-    quaternion.w += dq.w * dt;
-    quaternion.normalize();
-
-    // 13. Update telemetry display
-    updateTelemetry(roll, pitch, yaw);
-}
-
-// Process keyboard input
-function processInput(dt) {
-    // Throttle
-    if (keys.KeyW) desiredThrottle = Math.min(1.0, desiredThrottle + throttleStep * dt * 5); // W to increase
-    if (keys.KeyS) desiredThrottle = Math.max(0.0, desiredThrottle - throttleStep * dt * 5); // S to decrease
-
-    // Roll (A: left wing up -> negative roll, D: right wing up -> positive roll)
-    if (keys.ArrowLeft) desiredRoll = Math.max(-30, desiredRoll - rollStep * dt * 5);
-    if (keys.ArrowRight) desiredRoll = Math.min(30, desiredRoll + rollStep * dt * 5);
-
-    // Pitch (Up: nose up -> positive pitch, Down: nose down -> negative pitch)
-    if (keys.ArrowUp) desiredPitch = Math.min(30, desiredPitch + pitchStep * dt * 5);
-    if (keys.ArrowDown) desiredPitch = Math.max(-30, desiredPitch - pitchStep * dt * 5);
-
-    // Yaw (, : yaw left -> positive yaw, . : yaw right -> negative yaw)
-    if (keys.Comma) desiredYaw = Math.min(180, desiredYaw + yawStep * dt * 5);
-    if (keys.Period) desiredYaw = Math.max(-180, desiredYaw - yawStep * dt * 5);
-
-    // Optional: reset to center when keys released? We'll let it hold last value.
-}
-
-// Update telemetry display
-function updateTelemetry(roll, pitch, yaw) {
-    document.getElementById('altitude').textContent = position.y.toFixed(2);
-    document.getElementById('roll').textContent = roll.toFixed(2);
-    document.getElementById('pitch').textContent = pitch.toFixed(2);
-    document.getElementById('yaw').textContent = yaw.toFixed(2);
-
-    // Motor thrust percentage (0-100%)
-    const maxPossibleThrust = max_thrust; // at throttle=1
-    document.getElementById('motor1').textContent = Math.round((motorForces[0] / maxPossibleThrust) * 100);
-    document.getElementById('motor2').textContent = Math.round((motorForces[1] / maxPossibleThrust) * 100);
-    document.getElementById('motor3').textContent = Math.round((motorForces[2] / maxPossibleThrust) * 100);
-    document.getElementById('motor4').textContent = Math.round((motorForces[3] / maxPossibleThrust) * 100);
-}
-
-// Animation loop
-const clock = new THREE.Clock();
-
-function animate() {
-    requestAnimationFrame(animate);
-
-    const dt = clock.getDelta();
-
-    // Update physics
-    updatePhysics(dt);
-
-    // Update visuals
-    updateDroneVisual(dt);
-
-    // Render
-    renderer.render(scene, camera);
-}
-
-// Initialize when window loads
-window.onload = init;
+/* --------------------------------------------------------------
+     Drone Simulator – Pro Edition
+     Author:  (you can put your name here)
+     License: MIT – feel free to fork and improve
+     -------------------------------------------------------------- */
+
+  /* ==== CONFIGURATION ==== */
+  const CONFIG = {
+      // Physics
+      mass: 1.2,                 // kg
+      g: 9.81,                   // m/s²
+      maxThrust: 2.5 * 9.81,     // N (≈2.5× weight → generous thrust)
+      armLength: 0.4,            // m (distance from centre to motor)
+      inertia: {xx:0.08, yy:0.08, zz:0.12}, // kg·m²
+      thrustConstant: 0.0002,   // N/(rad/s)²  (tuned for visual thrust)
+      torqueConstant: 0.00002,  // N·m/(rad/s)² (yaw torque)
+
+      // PID gains (tuned for responsive but not aggressive behavior)
+      pidRoll:    {Kp:4.5, Ki:0.2, Kd:0.9},
+      pidPitch:   {Kp:4.5, Ki:0.2, Kd:0.9},
+      pidYaw:     {Kp:2.0, Ki:0.0, Kd:0.4},
+
+      // Input limits (degrees)
+      maxAngle: 25,              // roll/pitch/yaw limits from stick
+      throttleStep:0.015,        // per second when holding key
+      angleStep:1.2,             // degrees per second when holding key
+
+      // Visual
+      droneModelPath: "assets/drone.glb", // set to null to force procedural
+      groundSize: 200,
+      groundTexture: "assets/textures/grass.jpg",
+      skyTexture:   "assets/textures/sky.jpg",
+      bloomEnabled: true,
+      showWireframeFallback: true   // show simple shapes if model fails
+  };
+
+  /* ==== GLOBAL THREE.JS OBJECTS ==== */
+  let scene, camera, renderer, clock;
+  let droneGroup = null;          // will hold the visual model
+  let groundMesh;
+  let controls;                   // OrbitControls (debug only, can be removed)
+  let mixers = [];                // for GLTF animations (unused now)
+
+  /* ==== PHYSICS STATE ==== */
+  let position = new THREE.Vector3(0, 0, 0);
+  let velocity = new THREE.Vector3(0, 0, 0);
+  let quaternion = new THREE.Quaternion(); // body orientation (world)
+  let angularVelocity = new THREE.Vector3(); // body frame
+
+  // Desired setpoints from user input
+  let desired = {
+      throttle: 0,
+      roll: 0,
+      pitch: 0,
+      yaw: 0
+  };
+
+  // Motor forces (N) – will be computed each frame
+  let motorForces = [0,0,0,0];
+
+  /* ==== INPUT STATE ==== */
+  const keys = {
+      KeyW:false, KeyS:false,
+      ArrowLeft:false, ArrowRight:false,
+      ArrowUp:false, ArrowDown:false,
+      Comma:false, Period:false
+  };
+
+  let touchJoysticks = {left:{x:0,y:0}, right:{x:0,y:0}};
+
+  /* ==== PID CLASS ==== */
+  class PID {
+      constructor({Kp,Ki,Kd}){
+          this.Kp=Kp; this.Ki=Ki; this.Kd=Kd;
+          this.integral=0; this.prevError=0;
+      }
+      compute(error, dt){
+          if(dt<=0) return 0;
+          this.integral += error*dt;
+          const derivative = (error-this.prevError)/dt;
+          const out = this.Kp*error + this.Ki*this.integral + this.Kd*derivative;
+          this.prevError = error;
+          return out;
+      }
+      reset(){this.integral=0; this.prevError=0;}
+  }
+  const pidRoll = new PID(CONFIG.pidRoll);
+  const pidPitch = new PID(CONFIG.pidPitch);
+  const pidYaw = new PID(CONFIG.pidYaw);
+
+  /* ==== INIT ==== */
+  function init(){
+      // ----- Scene -----
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x87ceeb); // fallback sky
+
+      // ----- Camera -----
+      const aspect = window.innerWidth/window.innerHeight;
+      camera = new THREE.PerspectiveCamera(60, aspect, 0.1, 500);
+      camera.position.set(0,5,8);
+      camera.lookAt(0,0,0);
+
+      // ----- Renderer -----
+      const canvas = document.getElementById('droneCanvas');
+      renderer = new THREE.WebGLRenderer({canvas, antialias:true, powerPreference:"high-performance"});
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // cap for mobile
+      if(CONFIG.bloomEnabled){
+          // Simple bloom via EffectComposer (optional, lightweight)
+          const {EffectComposer} = THREE;
+          const {RenderPass} = THREE;
+          const {UnrealBloomPass} = THREE;
+          composer = new EffectComposer(renderer);
+          composer.addPass(new RenderPass(scene, camera));
+          const bloomPass = new UnrealBloomPass(
+              new THREE.Vector2(window.innerWidth, window.innerHeight),
+              0.3, 0.4, 0.85
+          );
+          composer.addPass(bloomPass);
+      }
+
+      // ----- Lights -----
+      const hemi = new THREE.HemisphereLight(0xffffbb, 0x080820, 1.2);
+      scene.add(hemi);
+      const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+      dir.position.set(5,12,6);
+      scene.add(dir);
+
+      // ----- Ground -----
+      const groundGeo = new THREE.PlaneGeometry(CONFIG.groundSize, CONFIG.groundSize);
+      let groundMat;
+      if(CONFIG.groundTexture){
+          const tex = new THREE.TextureLoader().load(CONFIG.groundTexture);
+          tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+          tex.repeat.set( CONFIG.groundSize/8, CONFIG.groundSize/8 );
+          groundMat = new THREE.MeshStandardMaterial({map:tex});
+      }else{
+          groundMat = new THREE.MeshStandardMaterial({color:0x555555});
+      }
+      groundMesh = new THREE.Mesh(groundGeo, groundMat);
+      groundMesh.rotation.x = -Math.PI/2;
+      scene.add(groundMesh);
+
+      // ----- Drone (model or procedural) -----
+      loadDroneModel();
+
+      // ----- OrbitControls (debug) -----
+      // Uncomment the lines below if you want mouse orbit while developing.
+      // controls = new THREE.OrbitControls(camera, renderer.domElement);
+      // controls.enableDamping = true;
+      // controls.minDistance = 2;
+      // controls.maxDistance = 20;
+
+      // ----- Input listeners -----
+      window.addEventListener('keydown', e=>{ if(keys.hasOwnProperty(e.code)) keys[e.code]=true; });
+      window.addEventListener('keyup',   e=>{ if(keys.hasOwnProperty(e.code)) keys[e.code]=false; });
+      window.addEventListener('resize', onWindowResize);
+      initTouchJoysticks();
+
+      // ----- Start loop -----
+      clock = new THREE.Clock();
+      animate();
+  }
+
+  /* ==== DRONE LOADING ==== */
+  function loadDroneModel(){
+      if(!CONFIG.droneModelPath){
+          createProceduralDrone();
+          return;
+      }
+      const loader = new THREE.GLTFLoader();
+      loader.load(
+          CONFIG.droneModelPath,
+          gltf=>{
+              droneGroup = gltf.scene;
+              droneGroup.traverse(o=>{
+                  if(o.isMesh){
+                      o.castShadow = true;
+                      o.receiveShadow = true;
+                  }
+              });
+              // Optional: center model at origin (many GLTFs are already centered)
+              const box = new THREE.Box3().setFromObject(droneGroup);
+              const center = box.getCenter(new THREE.Vector3());
+              droneGroup.position.sub(center);
+              scene.add(droneGroup);
+          },
+          undefined,
+          err=>{
+              console.warn("GLTF load failed, falling back to procedural drone.", err);
+              createProceduralDrone();
+          }
+      );
+  }
+
+  /* ==== PROCEDURAL LOW‑POLY DRONE ==== */
+  function createProceduralDrone(){
+      droneGroup = new THREE.Group();
+      // Central body
+      const bodyGeo = new THREE.BoxGeometry(0.3,0.3,0.2);
+      const bodyMat = new THREE.MeshStandardMaterial({color:0x606060});
+      const body = new THREE.Mesh(bodyGeo,bodyMat);
+      body.position.y = 0;
+      droneGroup.add(body);
+
+      // Arms + motors (simple cylinders)
+      const armColor = 0x009688;
+      const motorColor = 0x424242;
+      const propColor  = 0x212121;
+      const armLength = CONFIG.armLength * 0.9; // a tad shorter for visuals
+      const armThick = 0.04;
+      const armWidth = 0.12;
+      const motorRadius = 0.04;
+      const motorHeight = 0.02;
+      const propRadius = 0.14;
+      const propHeight = 0.01;
+
+      const armData = [
+          {pos:[ 0, 0, armLength], rot:[0,0,0]},   // front (+z)
+          {pos:[armLength,0, 0   ], rot:[0, Math.PI/2,0]}, // right (+x)
+          {pos:[ 0, 0,-armLength], rot:[0,0,0]},   // back (-z)
+          {pos:[-armLength,0, 0  ], rot:[0, Math.PI/2,0]} // left (-x)
+      ];
+
+      armData.forEach((d,i)=>{
+          // arm
+          const armGeo = new THREE.BoxGeometry(armThick, armWidth, armLength);
+          const armMat = new THREE.MeshStandardMaterial({color:armColor});
+          const arm = new THREE.Mesh(armGeo, armMat);
+          arm.position.set(...d.pos);
+          arm.rotation.set(...d.map((v,idx)=> idx<3?v*Math.PI/180:v));
+          droneGroup.add(arm);
+
+          // motor
+          const motorGeo = new THREE.CylinderGeometry(motorRadius,motorRadius,motorHeight,12);
+          const motorMat = new THREE.MeshStandardMaterial({color:motorColor});
+          const motor = new THREE.Mesh(motorGeo, motorMat);
+          motor.position.set(d.pos[0], d.pos[1], d.pos[2] + (d[2]===0?0: armLength/2));
+          droneGroup.add(motor);
+
+          // propeller (spinning disc)
+          const propGeo = new THREE.CylinderGeometry(propRadius,propRadius,propHeight,24);
+          const propMat = new THREE.MeshStandardMaterial({color:propColor});
+          const prop = new THREE.Mesh(propGeo, propMat);
+          // align disc perpendicular to arm
+          prop.rotation.set(
+              d[2]===0 ? Math.PI/2 : 0,
+              d[0]===0 ? 0 : Math.PI/2,
+              0
+          );
+          prop.position.set(d.pos[0], d.pos[1], d.pos[2] + (d[2]===0? armLength/2:0)+propHeight/2);
+          droneGroup.add(prop);
+          // store reference for spin animation
+          if(!droneGroup.propellers) droneGroup.propellers = [];
+          droneGroup.propellers.push(prop);
+      });
+
+      scene.add(droneGroup);
+  }
+
+  /* ==== WINDOW RESIZE ==== */
+  function onWindowResize(){
+      const w = window.innerWidth, h = window.innerHeight;
+      camera.aspect = w/h;
+      camera.updateProjectionMatrix();
+      renderer.setSize(w,h);
+      if(composer) composer.setSize(w,h);
+  }
+
+  /* ==== TOUCH JOYSTICKS ==== */
+  function initTouchJoysticks(){
+      const wrapper = document.getElementById('joystick-wrapper');
+      const hint = document.getElementById('touch-hint');
+      if('ontouchstart' in window || navigator.maxTouchPoints>0){
+          wrapper.style.display = 'flex';
+          hint.style.display = 'block';
+      }else{
+          wrapper.style.display = 'none';
+          hint.style.display = 'none';
+      }
+
+      const stickIDs = ['joystick-left','joystick-right'];
+      stickIDs.forEach((id, idx)=>{
+          const stick = document.getElementById(id);
+          let active = false;
+          const center = {x: stick.offsetWidth/2, y: stick.offsetHeight/2};
+
+          const getTouch = e=>{
+              if(!active) return;
+              const touch = e.touches[0] || e.changedTouches[0];
+              const rect = stick.getBoundingClientRect();
+              let dx = touch.clientX - rect.left - center.x;
+              let dy = touch.clientY - rect.top  - center.y;
+              const dist = Math.hypot(dx,dy);
+              const max = stick.offsetWidth/2 * 0.8; // 80% radius
+              if(dist>max){ const scale = max/dist; dx*=scale; dy*=scale; }
+              // normalize -1..1
+              touchJoysticks[idx].x = dx/(stick.offsetWidth/2*0.8);
+              touchJoysticks[idx].y = dy/(stick.offsetHeight/2*0.8);
+              // move visual nub
+              stick.style.setProperty('--nx', touchJoysticks[idx].x);
+              stick.style.setProperty('--ny', touchJoysticks[idx].y);
+          };
+          const start = e=>{ e.preventDefault(); active = true; getTouch(e); };
+          const move  = e=>{ e.preventDefault(); if(active) getTouch(e); };
+          const end   = e=>{ active = false; touchJoysticks[idx] = {x:0,y:0}; stick.style.removeProperty('--nx');
+  stick.style.removeProperty('--ny'); };
+
+          stick.addEventListener('touchstart', start);
+          stick.addEventListener('touchmove',  move);
+          stick.addEventListener('touchend',   end);
+          stick.addEventListener('touchcancel',end);
+      });
+  }
+
+  /* ==== INPUT PROCESSING ==== */
+  function processInput(dt){
+      // ----- Throttle (W/S) -----
+      if(keys.KeyW) desired.throttle = Math.min(1, desired.throttle + CONFIG.throttleStep*dt);
+      if(keys.KeyS) desired.throttle = Math.max(0, desired.throttle - CONFIG.throttleStep*dt);
+
+      // ----- Roll (A/D) -----
+      if(keys.ArrowLeft)  desired.roll  = Math.max(-CONFIG.maxAngle, desired.roll  - CONFIG.angleStep*dt);
+      if(keys.ArrowRight) desired.roll  = Math.min( CONFIG.maxAngle, desired.roll  + CONFIG.angleStep*dt);
+
+      // ----- Pitch (↑/↓) -----
+      if(keys.ArrowUp)    desired.pitch = Math.min( CONFIG.maxAngle, desired.pitch + CONFIG.angleStep*dt);
+      if(keys.ArrowDown)  desired.pitch = Math.max(-CONFIG.maxAngle, desired.pitch - CONFIG.angleStep*dt);
+
+      // ----- Yaw (,/.) -----
+      if(keys.Comma)      desired.yaw   = Math.min(180, desired.yaw   + CONFIG.angleStep*dt);
+      if(keys.Period)     desired.yaw   = Math.max(-180, desired.yaw   - CONFIG.angleStep*dt);
+
+      // ----- Touch joysticks -----
+      // Left stick -> throttle (Y) + roll (X)
+      desired.throttle = THREE.MathUtils.clamp(
+          desired.throttle - touchJoysticks.left.y * 0.5 * dt, 0, 1);
+      desired.roll = THREE.MathUtils.clamp(
+          touchJoysticks.left.x * CONFIG.maxAngle, -CONFIG.maxAngle, CONFIG.maxAngle);
+
+      // Right stick -> pitch (Y) + yaw (X)
+      desired.pitch = THREE.MathUtils.clamp(
+          -touchJoysticks.right.y * CONFIG.maxAngle, -CONFIG.maxAngle, CONFIG.maxAngle);
+      desired.yaw = THREE.MathUtils.clamp(
+          touchJoysticks.right.x * 180, -180, 180);
+  }
+
+  /* ==== PHYSICS UPDATE ==== */
+  function updatePhysics(dt){
+      // 1️⃣Convert quaternion → Euler (in degrees) for PID error
+      const euler = new THREE.Euler();
+      euler.setFromQuaternion(quaternion, 'XYZ'); // returns rad
+      const roll    = THREE.MathUtils.radToDeg(euler.x);
+      const pitch   = THREE.MathUtils.radToDeg(euler.y);
+      const yaw     = THREE.MathUtils.radToDeg(euler.z);
+
+      // 2️⃣Errors
+      const errRoll  = desired.roll  - roll;
+      const errPitch = desired.pitch - pitch;
+      const errYaw   = desired.yaw   - yaw;
+
+      // 3️⃣PID torques (body frame, N·m)
+      const tauRoll  = pidRoll.compute(errRoll,  dt);
+      const tauPitch = pidPitch.compute(errPitch,dt);
+      const tauYaw   = pidYaw.compute(errYaw,  dt);
+
+      // 4️⃣Collective thrust
+      const Ftotal = desired.throttle * CONFIG.maxThrust; // N
+
+      // 5️⃣Mixing matrix (quad‑X layout)
+      // Derived from:
+      //   tauRoll  = L * (-F2 + F4)
+      //   tauPitch = L * ( F1 - F3)
+      //   tauYaw   = b * ( F1 - F2 + F3 - F4)
+      //   Ftotal   = F1+F2+F3+F4
+      const L = CONFIG.armLength;
+      const b = CONFIG.torqueConstant;
+
+      // Solve for F2 & F3 first (see derivation in comments)
+      const S = (Ftotal - (tauRoll + tauPitch)/L) / 2; // F2+F3
+      const D = (tauYaw/b - (tauPitch - tauRoll)/L) / 2; // F3 - F2
+      const F2 = (S - D)/2;
+      const F3 = (S + D)/2;
+      const F1 = F3 + tauPitch/L;
+      const F4 = F2 + tauRoll/L;
+
+      motorForces = [F1, F2, F3, F4].map(f=>Math.max(0,f)); // no negative thrust
+
+      // 6️⃣Forces & torques in world frame
+      const thrustBody = new THREE.Vector3(0,0,-Ftotal); // -Z_body is up
+      const thrustWorld = thrustBody.clone().applyQuaternion(quaternion);
+      const gravity = new THREE.Vector3(0, -CONFIG.g, 0);
+      const forceWorld = thrustWorld.clone().add(gravity).divideScalar(CONFIG.mass); // a = F/m
+
+      // Torque in body frame
+      const torqueBody = new THREE.Vector3(tauRoll, tauPitch, tauYaw);
+      // Convert to world (needed for angular acceleration using world inertia? We'll keep body frame)
+      // We'll compute angular accel in body frame using body inertia (already diagonal)
+      const I = new THREE.Vector3(CONFIG.inertia.xx, CONFIG.inertia.yy, CONFIG.inertia.zz);
+      const Iomega = new THREE.Vector3(
+          I.x * angularVelocity.x,
+          I.y * angularVelocity.y,
+          I.z * angularVelocity.z
+      );
+      const cross = new THREE.Vector3(
+          angularVelocity.y * Iomega.z - angularVelocity.z * Iomega.y,
+          angularVelocity.z * Iomega.x - angularVelocity.x * Iomega.z,
+          angularVelocity.x * Iomega.y - angularVelocity.y * Iomega.x
+      );
+      const angularAccel = new THREE.Vector3(
+          (torqueBody.x - cross.x) / I.x,
+          (torqueBody.y - cross.y) / I.y,
+          (torqueBody.z - cross.z) / I.z
+      );
+
+      // 7️⃣Integrate linear motion (semi‑implicit Euler)
+      velocity.add(forceWorld.clone().multiplyScalar(dt));
+      position.add(velocity.clone().multiplyScalar(dt));
+
+      // 8️⃣Integrate angular motion
+      angularVelocity.add(angularAccel.clone().multiplyScalar(dt));
+      // Update orientation via quaternion
+      const omegaQuat = new THREE.Quaternion(
+          angularVelocity.x * dt * 0.5,
+          angularVelocity.y * dt * 0.5,
+          angularVelocity.z * dt * 0.5,
+          1
+      );
+      quaternion.multiply(omegaQuat).normalize();
+
+      // 9️⃣Update visual meshes
+      if(droneGroup){
+          droneGroup.position.copy(position);
+          droneGroup.setQuaternion(quaternion);
+          // spin propellers proportional to thrust
+          if(droneGroup.propellers){
+              droneGroup.propellers.forEach((prop, i)=>{
+                  const omega = Math.sqrt(Math.max(0, motorForces[i]) / CONFIG.thrustConstant) * 6; // rad/s visual
+                  prop.rotation.z += omega * dt;
+              });
+          }
+      }
+
+      // 10️⃣Update telemetry UI
+      document.getElementById('altitude').textContent = position.y.toFixed(2);
+      document.getElementById('roll').textContent    = roll.toFixed(2);
+      document.getElementById('pitch').textContent   = pitch.toFixed(2);
+      document.getElementById('yaw').textContent     = yaw.toFixed(2);
+      const maxPercent = CONFIG.maxThrust;
+      ['motor1','motor2','motor3','motor4'].forEach((id,idx)=>{
+          const pct = Math.round((motorForces[idx]/maxPercent)*100);
+          document.getElementById(id).textContent = pct;
+      });
+  }
+
+  /* ==== MAIN LOOP ==== */
+  function animate(){
+      requestAnimationFrame(animate);
+      const dt = clock.getDelta();
+      // Clamp dt to avoid huge spikes when tab is hidden
+      const clampedDt = Math.min(dt, 0.1);
+
+      processInput(clampedDt);
+      updatePhysics(clampedDt);
+
+      // Render
+      if(composer){
+          composer.render();
+      }else{
+          renderer.render(scene, camera);
+      }
+      // Update OrbitControls if enabled
+      // if(controls) controls.update();
+  }
+
+  /* ==== START ==== */
+  window.addEventListener('load', init);
