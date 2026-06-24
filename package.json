@@ -1,0 +1,27 @@
+{
+  "name": "drone-simulator",
+  "version": "1.0.0",
+  "description": "A realistic 3D drone simulator built with Three.js and Newtonian physics",
+  "main": "script.js",
+  "scripts": {
+    "start": "open index.html",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "drone",
+    "simulator",
+    "three.js",
+    "physics",
+    "3d",
+    "simulation"
+  ],
+  "author": "Drone Simulator Project",
+  "license": "MIT",
+  "dependencies": {
+    "three": "^0.128.0"
+  },
+  "devDependencies": {},
+  "browser": {
+    "./script.js": "./script.js"
+  }
+}
